@@ -1,0 +1,591 @@
+"use client";
+
+import React, { useState, useEffect } from "react";
+import AppShell from "@/components/AppShell";
+import {
+  Mail,
+  RefreshCw,
+  Trash2,
+  Play,
+  Eye,
+  CheckCircle2,
+  AlertCircle,
+  FileText,
+  Clock,
+  User,
+  Inbox,
+  ChevronDown,
+  X,
+} from "lucide-react";
+import {
+  listStagedDocuments,
+  getCachedStagedDocuments,
+  processStagedDocument,
+  deleteStagedDocument,
+  pollEmails,
+  getIMAPSettings,
+  getInvoiceFileUrl,
+  StagedDocument,
+} from "@/lib/api";
+
+export default function InboxPage() {
+  const [stagedDocs, setStagedDocs] = useState<StagedDocument[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isPolling, setIsPolling] = useState(false);
+  const [processingIds, setProcessingIds] = useState<Set<string>>(new Set());
+  const [notification, setNotification] = useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
+  const [previewDoc, setPreviewDoc] = useState<StagedDocument | null>(null);
+
+  // Email Account Filtering State
+  const [selectedEmail, setSelectedEmail] = useState<string>("ALL");
+  const [connectedEmails, setConnectedEmails] = useState<string[]>([]);
+
+  // Pagination State
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 10;
+
+  const loadDocuments = async (forceRefresh = false) => {
+    const cached = getCachedStagedDocuments();
+    if (!cached || cached.length === 0) {
+      if (forceRefresh || stagedDocs.length === 0) {
+        setIsLoading(true);
+      }
+    }
+    try {
+      const [docs, imap] = await Promise.all([
+        listStagedDocuments(forceRefresh),
+        getIMAPSettings().catch(() => null),
+      ]);
+
+      const sortedDocs = [...docs].sort((a, b) => {
+        const dateA = new Date(a.email_received_at || a.created_at).getTime();
+        const dateB = new Date(b.email_received_at || b.created_at).getTime();
+        return dateB - dateA;
+      });
+      setStagedDocs(sortedDocs);
+
+      // Dynamically extract connected and sender email accounts
+      const emailSet = new Set<string>();
+      if (imap?.email_address && imap.email_address.trim()) {
+        emailSet.add(imap.email_address.trim());
+      }
+      sortedDocs.forEach((d) => {
+        if (d.email_sender) {
+          const match = d.email_sender.match(/<([^>]+)>/) || [null, d.email_sender];
+          const extracted = (match[1] || d.email_sender).trim();
+          if (extracted && extracted.includes("@")) {
+            emailSet.add(extracted);
+          }
+        }
+      });
+      setConnectedEmails(Array.from(emailSet));
+    } catch (err: any) {
+      setNotification({ type: "error", message: err.message || "Failed to load staging queue." });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const cached = getCachedStagedDocuments();
+    if (cached && cached.length > 0) {
+      const sortedDocs = [...cached].sort((a, b) => {
+        const dateA = new Date(a.email_received_at || a.created_at).getTime();
+        const dateB = new Date(b.email_received_at || b.created_at).getTime();
+        return dateB - dateA;
+      });
+      setStagedDocs(sortedDocs);
+      setIsLoading(false);
+    }
+    loadDocuments(false);
+  }, []);
+
+  useEffect(() => {
+    if (notification) {
+      const timer = setTimeout(() => setNotification(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [notification]);
+
+  const handlePoll = async () => {
+    setIsPolling(true);
+    setNotification(null);
+    try {
+      const summary = await pollEmails();
+      setNotification({
+        type: "success",
+        message: `Checked ${summary.emails_checked} emails — ${summary.new_documents} new invoices added, ${summary.duplicates} duplicates skipped.`,
+      });
+      await loadDocuments();
+    } catch (err: any) {
+      setNotification({ type: "error", message: err.message || "Email polling failed." });
+    } finally {
+      setIsPolling(false);
+    }
+  };
+
+  const handleProcess = async (id: string) => {
+    setProcessingIds((prev) => { const n = new Set(prev); n.add(id); return n; });
+    try {
+      await processStagedDocument(id);
+      setNotification({ type: "success", message: "Invoice sent to AI extraction pipeline." });
+      setStagedDocs((prev) => prev.filter((d) => d.id !== id));
+    } catch (err: any) {
+      setNotification({ type: "error", message: err.message || "Failed to trigger extraction." });
+    } finally {
+      setProcessingIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
+    }
+  };
+
+  const handleDelete = async (id: string) => {
+    if (!confirm("Delete this staged attachment?")) return;
+    try {
+      await deleteStagedDocument(id);
+      setNotification({ type: "success", message: "Staged document deleted." });
+      setStagedDocs((prev) => prev.filter((d) => d.id !== id));
+    } catch (err: any) {
+      setNotification({ type: "error", message: err.message || "Failed to delete." });
+    }
+  };
+
+  const formatSize = (bytes: number) => {
+    if (!bytes) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + " " + sizes[i];
+  };
+
+  const formatTime = (iso: string | null | undefined) => {
+    if (!iso) return "—";
+    try {
+      const d = new Date(iso);
+      return d.toLocaleDateString() + " " + d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch { return iso; }
+  };
+
+  // Filter staged documents based on selected email
+  const filteredDocs = stagedDocs.filter((doc) => {
+    if (selectedEmail === "ALL") return true;
+    if (!doc.email_sender) return false;
+    return doc.email_sender.toLowerCase().includes(selectedEmail.toLowerCase());
+  });
+
+  const headerActions = (
+    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+      {/* Email Account Dropdown Selector */}
+      <div style={{ position: "relative", display: "inline-flex", alignItems: "center" }}>
+        <Mail size={13} style={{ position: "absolute", left: "10px", color: "var(--text-secondary)", pointerEvents: "none" }} />
+        <select
+          value={selectedEmail}
+          onChange={(e) => {
+            setSelectedEmail(e.target.value);
+            setCurrentPage(1);
+          }}
+          style={{
+            paddingLeft: "28px",
+            paddingRight: "26px",
+            height: "32px",
+            fontSize: "12.5px",
+            fontWeight: "500",
+            cursor: "pointer",
+            appearance: "none",
+            WebkitAppearance: "none",
+            background: "#ffffff",
+            border: "1px solid var(--border-subtle)",
+            borderRadius: "var(--radius-sm)",
+            color: "var(--text-primary)",
+            boxShadow: "var(--shadow-sm)",
+          }}
+          title="Filter documents by connected email account"
+        >
+          <option value="ALL">All Emails</option>
+          {connectedEmails.map((email) => (
+            <option key={email} value={email}>
+              {email}
+            </option>
+          ))}
+        </select>
+        <ChevronDown size={13} style={{ position: "absolute", right: "8px", color: "var(--text-secondary)", pointerEvents: "none" }} />
+      </div>
+
+      {/* Check Mail Button */}
+      <button
+        onClick={handlePoll}
+        disabled={isPolling}
+        className="btn btn-primary"
+        style={{ display: "flex", alignItems: "center", gap: "8px", padding: "7px 16px", fontSize: "13px" }}
+      >
+        <RefreshCw size={14} className={isPolling ? "animate-spin" : ""} />
+        {isPolling ? "Checking..." : "Check Mail"}
+      </button>
+    </div>
+  );
+
+  // Pagination Slice
+  const indexOfLastItem = currentPage * itemsPerPage;
+  const indexOfFirstItem = indexOfLastItem - itemsPerPage;
+  const currentItems = filteredDocs.slice(indexOfFirstItem, indexOfLastItem);
+  const totalPages = Math.ceil(filteredDocs.length / itemsPerPage);
+
+  return (
+    <AppShell title="Inbox" subtitle="Email Staging Queue" actions={headerActions} hideHealthBadge>
+
+      {/* Notification Banner */}
+      {notification && (
+        <div
+          style={{
+            marginBottom: "20px",
+            padding: "13px 16px",
+            borderRadius: "var(--radius-sm)",
+            background: notification.type === "success" ? "#ecfdf5" : "#fef2f2",
+            border: `1px solid ${notification.type === "success" ? "#a7f3d0" : "#fca5a5"}`,
+            color: notification.type === "success" ? "#065f46" : "#991b1b",
+            display: "flex",
+            alignItems: "center",
+            gap: "10px",
+            fontSize: "13.5px",
+          }}
+        >
+          {notification.type === "success" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+          <span style={{ flex: 1 }}>{notification.message}</span>
+          <button onClick={() => setNotification(null)} style={{ background: "none", border: "none", color: "inherit", cursor: "pointer" }}>
+            <X size={15} />
+          </button>
+        </div>
+      )}
+
+      {/* Stats Bar */}
+      <div
+        style={{
+          display: "flex",
+          gap: "1px",
+          marginBottom: "20px",
+          background: "#ffffff",
+          border: "1px solid var(--border-subtle)",
+          borderRadius: "var(--radius-sm)",
+          overflow: "hidden",
+          boxShadow: "var(--shadow-sm)",
+        }}
+      >
+        {[
+          { label: "Total Staged", value: filteredDocs.length, color: "var(--accent)" },
+          { label: "PDFs", value: filteredDocs.filter((d) => d.mime_type === "application/pdf").length, color: "#7c3aed" },
+          { label: "Images", value: filteredDocs.filter((d) => d.mime_type?.startsWith("image/")).length, color: "#0891b2" },
+        ].map((stat) => (
+          <div
+            key={stat.label}
+            style={{
+              flex: 1,
+              padding: "16px 20px",
+              borderRight: "1px solid var(--border-subtle)",
+            }}
+          >
+            <div style={{ fontSize: "22px", fontWeight: "700", color: stat.color, lineHeight: 1 }}>
+              {isLoading ? "—" : stat.value}
+            </div>
+            <div style={{ fontSize: "11px", color: "var(--text-secondary)", marginTop: "4px", fontWeight: "500" }}>
+              {stat.label}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Main Table */}
+      <div
+        style={{
+          background: "#ffffff",
+          border: "1px solid var(--border-subtle)",
+          borderRadius: "var(--radius-md)",
+          overflow: "hidden",
+          boxShadow: "var(--shadow-sm)",
+        }}
+      >
+        {isLoading ? (
+          <div style={{ textAlign: "center", padding: "80px 0", color: "var(--text-secondary)" }}>
+            <RefreshCw size={32} className="animate-spin" style={{ marginBottom: "16px", color: "var(--accent)" }} />
+            <p style={{ fontSize: "14px" }}>Loading staging queue...</p>
+          </div>
+        ) : stagedDocs.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "80px 40px", color: "var(--text-secondary)" }}>
+            <Inbox size={44} style={{ marginBottom: "16px", strokeWidth: 1.5, color: "#cbd5e1" }} />
+            <h3 style={{ fontSize: "15px", fontWeight: "600", color: "var(--text-primary)", marginBottom: "6px" }}>
+              Queue is Empty
+            </h3>
+            <p style={{ fontSize: "13px", maxWidth: "340px", margin: "0 auto 20px" }}>
+              No staged documents. Click "Check Mail" to fetch new emails, or configure email in Integrations.
+            </p>
+          </div>
+        ) : (
+          <div>
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: "13px", textAlign: "left" }}>
+                <thead>
+                  <tr
+                    style={{
+                      background: "#fafafa",
+                      borderBottom: "1px solid var(--border-subtle)",
+                      color: "var(--text-secondary)",
+                      fontWeight: "600",
+                      fontSize: "11px",
+                      textTransform: "uppercase",
+                      letterSpacing: "0.04em",
+                    }}
+                  >
+                    <th style={{ padding: "14px 20px" }}>Email Source</th>
+                    <th style={{ padding: "14px 20px" }}>Attachment</th>
+                    <th style={{ padding: "14px 20px" }}>Received</th>
+                    <th style={{ padding: "14px 20px", textAlign: "right" }}>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {currentItems.map((doc) => (
+                    <tr
+                      key={doc.id}
+                      style={{ borderBottom: "1px solid var(--border-subtle)" }}
+                      className="hover-row"
+                    >
+                      <td style={{ padding: "16px 20px", verticalAlign: "top", maxWidth: "280px" }}>
+                        <div
+                          style={{
+                            fontWeight: "600",
+                            color: "var(--text-primary)",
+                            marginBottom: "4px",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                        >
+                          {doc.email_subject || "(No Subject)"}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "12px", color: "var(--text-secondary)" }}>
+                          <User size={11} />
+                          <span>{doc.email_sender}</span>
+                        </div>
+                      </td>
+                      <td style={{ padding: "16px 20px", verticalAlign: "top" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "7px", fontWeight: "500", color: "var(--text-primary)", marginBottom: "4px", flexWrap: "wrap" }}>
+                          <FileText size={13} color="var(--accent)" />
+                          <span>{doc.file_name}</span>
+                          {doc.financial_relevance === "UNKNOWN" && (
+                            <span
+                              style={{
+                                display: "inline-flex",
+                                alignItems: "center",
+                                gap: "3px",
+                                fontSize: "10.5px",
+                                fontWeight: "600",
+                                color: "#b45309",
+                                backgroundColor: "#fef3c7",
+                                border: "1px solid #fde68a",
+                                padding: "1px 6px",
+                                borderRadius: "4px",
+                                marginLeft: "6px",
+                              }}
+                              title={doc.classification_reason || "AI could not confidently classify this document. Manual review required."}
+                            >
+                              <AlertCircle size={10} color="#b45309" /> ⚠ UNCERTAIN
+                            </span>
+                          )}
+                        </div>
+                        <div style={{ fontSize: "11px", color: "var(--text-secondary)" }}>
+                          {formatSize(doc.file_size || 0)} · {doc.mime_type}
+                        </div>
+                      </td>
+                      <td style={{ padding: "16px 20px", verticalAlign: "top", color: "var(--text-secondary)", fontSize: "12px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                          <Clock size={11} />
+                          <span>{formatTime(doc.email_received_at || doc.created_at)}</span>
+                        </div>
+                      </td>
+                      <td style={{ padding: "16px 20px", verticalAlign: "top", textAlign: "right" }}>
+                        <div style={{ display: "flex", gap: "6px", justifyContent: "flex-end" }}>
+                          <button
+                            onClick={() => setPreviewDoc(doc)}
+                            className="btn btn-secondary"
+                            style={{ padding: "5px 10px", fontSize: "12px", display: "flex", alignItems: "center", gap: "4px" }}
+                            title="Preview file"
+                          >
+                            <Eye size={12} /> Preview
+                          </button>
+                          <button
+                            onClick={() => handleDelete(doc.id)}
+                            className="btn btn-secondary"
+                            style={{ padding: "5px 10px", fontSize: "12px", color: "#dc2626", display: "flex", alignItems: "center", gap: "4px" }}
+                            title="Delete from queue"
+                          >
+                            <Trash2 size={12} />
+                          </button>
+                          <button
+                            onClick={() => handleProcess(doc.id)}
+                            disabled={processingIds.has(doc.id)}
+                            className="btn btn-primary"
+                            style={{ padding: "5px 12px", fontSize: "12px", display: "flex", alignItems: "center", gap: "4px" }}
+                            title="Send to AI pipeline"
+                          >
+                            {processingIds.has(doc.id) ? (
+                              <><RefreshCw size={11} className="animate-spin" /> Queuing...</>
+                            ) : (
+                              <><Play size={11} /> Process</>
+                            )}
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination Controls */}
+            {totalPages > 1 && (
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  padding: "16px 24px",
+                  borderTop: "1px solid var(--border-subtle)",
+                  background: "#fafafa",
+                  gap: "8px",
+                }}
+              >
+                <button
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={currentPage === 1}
+                  className="btn btn-secondary"
+                  style={{ padding: "6px 12px", fontSize: "12.5px" }}
+                >
+                  Previous
+                </button>
+                {Array.from({ length: totalPages }, (_, i) => i + 1).map((pageNumber) => (
+                  <button
+                    key={pageNumber}
+                    onClick={() => setCurrentPage(pageNumber)}
+                    className={`btn ${currentPage === pageNumber ? "btn-primary" : "btn-secondary"}`}
+                    style={{
+                      padding: "6px 12px",
+                      fontSize: "12.5px",
+                      background: currentPage === pageNumber ? "var(--accent)" : "#ffffff",
+                      color: currentPage === pageNumber ? "#ffffff" : "var(--text-primary)",
+                      minWidth: "36px",
+                    }}
+                  >
+                    {pageNumber}
+                  </button>
+                ))}
+                <button
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={currentPage === totalPages}
+                  className="btn btn-secondary"
+                  style={{ padding: "6px 12px", fontSize: "12.5px" }}
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* File Preview Modal */}
+      {previewDoc && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0, left: 0, right: 0, bottom: 0,
+            background: "rgba(0,0,0,0.5)",
+            zIndex: 1000,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            backdropFilter: "blur(2px)",
+            padding: "20px",
+          }}
+        >
+          <div
+            style={{
+              width: "100%",
+              maxWidth: "800px",
+              height: "90vh",
+              background: "#ffffff",
+              borderRadius: "var(--radius-md)",
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              boxShadow: "0 25px 50px -12px rgba(0,0,0,0.25)",
+            }}
+          >
+            <div
+              style={{
+                padding: "16px 24px",
+                borderBottom: "1px solid var(--border-subtle)",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+              }}
+            >
+              <div>
+                <h4 style={{ fontWeight: "600", fontSize: "15px", color: "var(--text-primary)", marginBottom: "2px" }}>
+                  {previewDoc.file_name}
+                </h4>
+                <p style={{ fontSize: "12px", color: "var(--text-secondary)" }}>
+                  From: {previewDoc.email_subject}
+                </p>
+              </div>
+              <button
+                onClick={() => setPreviewDoc(null)}
+                style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-secondary)", padding: "4px" }}
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div style={{ flex: 1, minHeight: 0, backgroundColor: "#f1f3f4", position: "relative", display: "flex", flexDirection: "column" }}>
+              {previewDoc.file_name.toLowerCase().endsWith(".pdf") ? (
+                <iframe
+                  src={getInvoiceFileUrl(previewDoc.id)}
+                  title="PDF Preview"
+                  style={{ width: "100%", height: "100%", border: "none" }}
+                />
+              ) : (
+                <div
+                  style={{
+                    flex: 1,
+                    width: "100%",
+                    height: "100%",
+                    overflowY: "auto",
+                    overflowX: "auto",
+                    padding: "24px",
+                    boxSizing: "border-box",
+                    backgroundColor: "#f1f3f4",
+                  }}
+                >
+                  <img
+                    src={getInvoiceFileUrl(previewDoc.id)}
+                    alt="Invoice Attachment"
+                    style={{
+                      width: "100%",
+                      height: "auto",
+                      display: "block",
+                      margin: "0 auto",
+                      borderRadius: "4px",
+                      boxShadow: "0 4px 16px rgba(0,0,0,0.15)",
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <style jsx>{`
+        .hover-row:hover { background-color: #fafafa !important; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+      `}</style>
+    </AppShell>
+  );
+}
