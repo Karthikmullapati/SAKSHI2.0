@@ -448,13 +448,7 @@ export async function getInvoiceStatus(id: string): Promise<InvoiceStatus> {
   return res.json();
 }
 
-export async function listInvoices(): Promise<InvoiceListItem[]> {
-  const authHeaders = await getAuthHeaders();
-  const res = await fetch(`${API_BASE}/invoices`, {
-    headers: authHeaders,
-    cache: "no-store",
-  });
-
+export async function listInvoices(forceRefresh: boolean = false): Promise<InvoiceListItem[]> {
   if (!forceRefresh && !inMemoryInvoices && typeof window !== "undefined") {
     const cached = getCachedInvoices();
     if (cached) {
@@ -599,6 +593,7 @@ export async function getHealth(): Promise<HealthResponse> {
 export interface UserProfile {
   id: string;
   email: string;
+  full_name?: string;
   role: string;
   tenant_id: string;
 }
